@@ -1,10 +1,10 @@
 name: Keep All Streamlit Apps Awake
-
 on:
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
-
+permissions:
+  contents: write
 jobs:
   wake:
     runs-on: ubuntu-latest
@@ -12,16 +12,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
-          pip install playwright
+          pip install playwright requests
           playwright install --with-deps chromium
-
       - name: Visit and wake all apps
         run: python wake.py
+      - name: Heartbeat so GitHub never disables this schedule
+        run: |
+          if [ -z "$(find .last_wake -mtime -45 2>/dev/null)" ]; then
+            git config user.name "wake-bot"
+            git config user.email "wake-bot@users.noreply.github.com"
+            date -u > .last_wake
+            git add .last_wake
+            git commit -m "keep schedule alive" && git push || true
+          fi
