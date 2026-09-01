@@ -1,56 +1,109 @@
+"""Keep every Streamlit app awake, current and future.
+Discovers all public repositories of the account, assumes the standard naming
+convention repo-name -> https://repo-name.streamlit.app/, health checks each,
+and clicks sleeping apps awake with Playwright. New apps are covered
+automatically the moment they deploy under a matching name."""
 import time
-from pathlib import Path
+import requests
 from playwright.sync_api import sync_playwright
 
-WAKE_TEXT = "get this app back up"
+USER = "yinkaadx"
+EXTRA_APPS = []        # full app URLs whose repo name does not match the convention
+SKIP_REPOS = set()     # repo names to ignore (never apps)
+WAKE_WAIT_SECONDS = 150
 
 
-def find_wake_button(page):
-    for frame in page.frames:
-        try:
-            btn = frame.get_by_role("button").filter(has_text=WAKE_TEXT)
-            if btn.count() > 0:
-                return btn.first
-            btn = frame.get_by_text(WAKE_TEXT, exact=False)
-            if btn.count() > 0:
-                return btn.first
-        except Exception:
-            continue
-    return None
+def all_repo_names():
+    names, page = [], 1
+    while True:
+        r = requests.get(
+            f"https://api.github.com/users/{USER}/repos",
+            params={"per_page": 100, "page": page, "type": "owner"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        names += [x["name"] for x in batch]
+        if len(batch) < 100:
+            break
+        page += 1
+    return [n for n in names if n not in SKIP_REPOS]
 
 
-def visit(page, url):
-    page.goto(url, timeout=90000, wait_until="domcontentloaded")
-    time.sleep(10)  # let the websocket connect so it counts as real traffic
-    btn = find_wake_button(page)
-    if btn:
-        btn.click()
-        print(f"[WOKE UP] {url} was asleep, clicked the wake button")
-        time.sleep(45)  # give it time to boot
-    else:
-        print(f"[OK] {url} is awake, timer reset")
+def is_healthy(url):
+    try:
+        r = requests.get(url.rstrip("/") + "/_stcore/health", timeout=15)
+        return r.ok and r.text.strip() == "ok"
+    except requests.RequestException:
+        return False
+
+
+def looks_like_app(url):
+    try:
+        r = requests.get(url, timeout=20)
+        return r.status_code < 400
+    except requests.RequestException:
+        return False
+
+
+def try_wake(pw_page, url):
+    try:
+        pw_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        pw_page.wait_for_timeout(5000)
+        for selector in [
+            "text=Yes, get this app back up",
+            "text=get this app back up",
+            "button:has-text('back up')",
+        ]:
+            try:
+                pw_page.click(selector, timeout=4000)
+                break
+            except Exception:
+                continue
+        deadline = time.time() + WAKE_WAIT_SECONDS
+        while time.time() < deadline:
+            if is_healthy(url):
+                return True
+            time.sleep(10)
+        return is_healthy(url)
+    except Exception:
+        return False
 
 
 def main():
-    urls = [u.strip() for u in Path("apps.txt").read_text().splitlines()
-            if u.strip() and not u.strip().startswith("#")]
-    print(f"Checking {len(urls)} apps...")
-    failures = []
+    names = all_repo_names()
+    urls = sorted({f"https://{n}.streamlit.app/" for n in names} | set(EXTRA_APPS))
+    print(f"discovered {len(names)} repos, probing {len(urls)} candidate apps")
+    awake, woke, failed, not_app = [], [], [], []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
+        pw_page = browser.new_page()
         for url in urls:
-            try:
-                visit(page, url)
-            except Exception as e:
-                failures.append(url)
-                print(f"[ERROR] {url}: {e}")
+            if is_healthy(url):
+                awake.append(url)
+                print(f"AWAKE   {url}")
+                continue
+            if not looks_like_app(url):
+                not_app.append(url)
+                print(f"SKIP    {url} (no app deployed under this name)")
+                continue
+            print(f"WAKING  {url}")
+            if try_wake(pw_page, url):
+                woke.append(url)
+                print(f"WOKE    {url}")
+            else:
+                failed.append(url)
+                print(f"FAILED  {url}")
         browser.close()
-    print(f"Done. {len(urls) - len(failures)} ok, {len(failures)} failed.")
-    if failures:
-        print("Failed apps:")
-        for u in failures:
-            print(f"  - {u}")
+    print("\nsummary")
+    print(f"  already awake : {len(awake)}")
+    print(f"  woken now     : {len(woke)}")
+    print(f"  not an app    : {len(not_app)}")
+    print(f"  failed        : {len(failed)}")
+    for u in failed:
+        print(f"  FAILED {u}")
 
 
 if __name__ == "__main__":
